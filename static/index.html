@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Data2Form Pro | Excel Automation Dashboard</title>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Jost:wght@400;500;600;700&family=Overpass+Mono:wght@400;600;700&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+
+<body>
+    <!-- Premium Mesh Gradient Background -->
+    <div class="mesh-background">
+        <div class="blob blob-1"></div>
+        <div class="blob blob-2"></div>
+        <div class="blob blob-3"></div>
+    </div>
+
+    <main class="dashboard">
+        <aside class="sidebar bento-card">
+            <div class="logo">
+                <div class="logo-icon">D2F</div>
+                <h1>Data2Form <span>Pro</span></h1>
+            </div>
+            <nav>
+                <div class="nav-item active" id="nav-upload" onclick="showSection('upload')">
+                    <span class="icon">📁</span> <span data-i18n="nav_upload">Tải file & Cấu hình</span>
+                </div>
+                <div class="nav-item" id="nav-monitoring" onclick="showSection('monitoring')">
+                    <span class="icon">📊</span> <span data-i18n="nav_monitoring">Giám sát & Logs</span>
+                </div>
+                <div class="nav-item" id="nav-history" onclick="showSection('history')">
+                    <span class="icon">📜</span> <span data-i18n="nav_history">Lịch sử thực thi</span>
+                </div>
+            </nav>
+            <div class="sidebar-lang">
+                <button class="lang-btn active" id="btn-vi" onclick="setLanguage('vi')">VN</button>
+                <button class="lang-btn" id="btn-en" onclick="setLanguage('en')">EN</button>
+            </div>
+            <div class="sidebar-footer">
+                <p>Version 2.1.0</p>
+            </div>
+        </aside>
+
+        <div class="main-content">
+            <!-- Step 1 & 2: Upload & Preview -->
+            <div id="section-upload" class="content-section active">
+                <div class="section-header">
+                    <h2 data-i18n="setup_title">Thiết lập Tự động hóa</h2>
+                    <p data-i18n="setup_desc">Tải file Excel và ánh xạ các trường dữ liệu lên Form Web</p>
+                </div>
+
+                <div class="grid-layout">
+                    <!-- Left: Upload & URL -->
+                    <div class="card bento-card config-card">
+                        <div class="upload-zone" id="drop-zone">
+                            <input type="file" id="excel-file" accept=".xlsx, .xls">
+                            <div class="upload-icon">⬆️</div>
+                            <h3 data-i18n="upload_title">Tải file Excel của bạn</h3>
+                            <p data-i18n="upload_desc">Kéo thả file vào đây hoặc nhấn để chọn</p>
+                            <div id="file-name" class="file-info"></div>
+                            <div class="reset-actions"
+                                style="display: flex; gap: 10px; justify-content: center; margin-top: 10px;">
+                                <button id="change-file-btn" class="btn-info" style="display: none;"
+                                    onclick="changeFileOnly(event)" data-i18n="btn_change_file">Chỉ đổi file</button>
+                                <button id="reset-btn" class="btn-secondary" style="display: none;"
+                                    onclick="resetAll(event)" data-i18n="btn_reset">Đặt lại toàn bộ</button>
+                            </div>
+                        </div>
+
+                        <div class="config-form">
+                            <div class="input-group">
+                                <label data-i18n="label_url">URL Trang Web Đích</label>
+                                <div class="url-input-wrapper">
+                                    <input type="url" id="target-url" placeholder="https://example.com/form"
+                                        oninput="handleUrlInput()" disabled>
+                                </div>
+                            </div>
+                            <div class="input-group checkbox-group">
+                                <input type="checkbox" id="use-session" disabled>
+                                <label for="use-session" data-i18n="label_use_session">Duy trì phiên đăng nhập
+                                    (Persistent)</label>
+                            </div>
+                            <div class="input-group">
+                                <label data-i18n="label_submit">CSS Selector Nút Gửi (Submit)</label>
+                                <div class="selector-wrapper">
+                                    <input type="text" id="submit-selector" placeholder="#submit-btn" disabled>
+                                    <button class="icon-btn" id="pick-submit-btn"
+                                        onclick="pickSelector('submit-selector')" title="Chọn trực tiếp"
+                                        disabled>🎯</button>
+                                </div>
+                            </div>
+                            <div class="input-group">
+                                <label data-i18n="label_trigger">⚡ Trigger mở Popup/Modal (tùy chọn)</label>
+                                <div class="selector-wrapper">
+                                    <input type="text" id="open-form-trigger"
+                                        placeholder="Selector nút mở form (vd: .btn-add-new)" disabled>
+                                    <button class="icon-btn" id="pick-trigger-btn"
+                                        onclick="pickSelector('open-form-trigger')" title="Chọn trigger"
+                                        disabled>🎯</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Right: Preview & Mapping -->
+                    <div class="card bento-card preview-card" id="preview-card" style="display: none;">
+                        <div class="card-header">
+                            <div class="header-left">
+                                <h3 data-i18n="preview_title">Xem trước</h3> (<span id="total-count">0</span> <span
+                                    data-i18n="rows_per_page">dòng</span>)
+                                <select id="page-size" onchange="handlePageSizeChange()" class="page-size-select">
+                                    <option value="10" data-i18n-rows="10">10 dòng</option>
+                                    <option value="20" data-i18n-rows="20">20 dòng</option>
+                                    <option value="50" data-i18n-rows="50">50 dòng</option>
+                                    <option value="100" data-i18n-rows="100">100 dòng</option>
+                                    <option value="1000" data-i18n-rows="1000">1000 dòng</option>
+                                </select>
+                            </div>
+                            <div class="search-box">
+                                <input type="text" id="preview-search" placeholder="Lọc nhanh..."
+                                    oninput="handleSearch()">
+                            </div>
+                        </div>
+                        <div class="table-wrapper">
+                            <table id="preview-table">
+                                <thead id="preview-thead"></thead>
+                                <tbody id="preview-tbody"></tbody>
+                            </table>
+                        </div>
+                        <div class="pagination-bar">
+                            <button onclick="changePage(-1)" id="prev-btn" disabled data-i18n="prev">Trước</button>
+                            <span id="page-info">Trang 1</span>
+                            <button onclick="changePage(1)" id="next-btn" disabled data-i18n="next">Sau</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card bento-card" id="mapping-card" style="display: none;">
+                    <div class="card-header">
+                        <h3 data-i18n="mapping_title">Ánh xạ cột Excel (Mapping)</h3>
+                    </div>
+                    <div class="mapping-grid" id="mapping-container">
+                        <!-- Dynamic mapping rows -->
+                    </div>
+                    <div class="action-footer">
+                        <button id="run-btn" class="btn-primary" data-i18n="btn_run">Bắt đầu Chạy Tự động</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Section Monitoring -->
+            <div id="section-monitoring" class="content-section">
+                <div class="section-header">
+                    <h2 data-i18n="monitor_title">Giám sát Tiến độ</h2>
+                    <p data-i18n="monitor_desc">Theo dõi quá trình nhập liệu thời gian thực</p>
+                </div>
+
+                <div class="monitor-grid">
+                    <div class="card bento-card status-card">
+                        <div class="status-header">
+                            <div>
+                                <h3><span data-i18n="history_status">Trạng thái</span>: <span id="status-text"
+                                        data-i18n="status_stopped">Đang dừng</span></h3>
+                            </div>
+                            <div class="status-indicator" id="status-led"></div>
+                        </div>
+                        <div class="progress-container">
+                            <div class="progress-labels">
+                                <span data-i18n="progress_label">Tiến độ</span>
+                                <span id="progress-percent">0%</span>
+                            </div>
+                            <div class="progress-bar">
+                                <div id="progress-fill"></div>
+                            </div>
+                            <p id="progress-info" data-i18n="wait_start">Chờ bắt đầu...</p>
+                        </div>
+                    </div>
+
+                    <div class="card bento-card console-card">
+                        <div class="card-header">
+                            <h3 data-i18n="logs_title">Live Console Logs</h3>
+                            <div class="log-search-wrapper">
+                                <input type="text" id="log-search" placeholder="Tìm trong log..."
+                                    oninput="handleLogSearch()">
+                                <span id="log-search-info">0/0</span>
+                                <button class="icon-btn" onclick="navLogSearch(-1)">↑</button>
+                                <button class="icon-btn" onclick="navLogSearch(1)">↓</button>
+                            </div>
+                            <button class="text-btn" onclick="clearLogs()" data-i18n="btn_clear_log">Xóa log</button>
+                        </div>
+                        <div id="console-logs" class="console-body">
+                            <div class="log-line system" data-i18n="status_ready">Sẵn sàng.</div>
+                        </div>
+                    </div>
+
+                    <div class="card bento-card screenshots-card">
+                        <div class="card-header">
+                            <h3 data-i18n="screenshots_title">Ảnh chụp màn hình lỗi (nếu có)</h3>
+                        </div>
+                        <div id="screenshots-container" class="screenshot-grid">
+                            <!-- Screenshots here -->
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Section History -->
+            <div id="section-history" class="content-section">
+                <div class="section-header">
+                    <h2 data-i18n="history_title">Lịch sử thực thi</h2>
+                    <p data-i18n="history_desc">Danh sách các lần chạy tự động hóa trước đó</p>
+                </div>
+                <div class="card bento-card">
+                    <div class="table-wrapper">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th data-i18n="history_time">Thời gian</th>
+                                    <th data-i18n="history_filename">Tên file</th>
+                                    <th data-i18n="history_rows">Số dòng</th>
+                                    <th data-i18n="history_status">Trạng thái</th>
+                                    <th data-i18n="history_actions">Hành động</th>
+                                </tr>
+                            </thead>
+                            <tbody id="history-tbody">
+                                <!-- History rows here -->
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+                <!-- Container for expanded logs -->
+                <div id="expanded-logs-container" style="display: none; margin-top: 20px;">
+                    <div class="card bento-card">
+                        <div class="card-header">
+                            <h3 id="expanded-logs-title" data-i18n="expanded_logs">Nhật ký chi tiết</h3>
+                            <div class="log-search-wrapper">
+                                <input type="text" id="hist-log-search" placeholder="Tìm trong lịch sử..."
+                                    oninput="handleHistLogSearch()">
+                                <span id="hist-log-search-info">0/0</span>
+                                <button class="icon-btn" onclick="navHistLogSearch(-1)">↑</button>
+                                <button class="icon-btn" onclick="navHistLogSearch(1)">↓</button>
+                            </div>
+                            <button class="text-btn" onclick="closeExpandedLogs()" data-i18n="btn_close">Đóng x</button>
+                        </div>
+                        <div id="expanded-console" class="console-body"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Global Loading Overlay -->
+    <div id="loading-overlay" class="loading-overlay">
+        <div class="loader"></div>
+        <p id="loading-text" data-i18n="loading">Đang tải...</p>
+    </div>
+
+    <!-- Custom Confirmation Modal -->
+    <div id="confirm-modal" class="modal-overlay" style="display: none;">
+        <div class="modal-content bento-card">
+            <div class="modal-header">
+                <h3>⚠️ Xác nhận Đặt lại</h3>
+            </div>
+            <div class="modal-body">
+                <p>Bạn có chắc chắn muốn <strong>ĐẶT LẠI TOÀN BỘ</strong>?</p>
+                <p class="sub-text">Tất cả URL, file Excel và cấu hình Mapping hiện tại sẽ bị xóa sạch và không thể khôi
+                    phục.</p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-secondary" onclick="closeConfirmModal()">Hủy bỏ</button>
+                <button class="btn-danger" id="confirm-reset-btn">Xác nhận Xóa</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Notification Toasts -->
+    <div id="toast-container" class="toast-container"></div>
+
+    <script src="/static/script.js"></script>
+</body>
+
+</html> <button class="btn-secondary" onclick="closeConfirmModal()">Hủy bỏ</button>
+<button class="btn-danger" id="confirm-reset-btn">Xác nhận Xóa</button>
+</div>
+</div>
+</div>
+
+<!-- Notification Toasts -->
+<div id="toast-container" class="toast-container"></div>
+
+<script src="/static/script.js"></script>
+</body>
+
+</html>

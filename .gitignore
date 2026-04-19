@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+*.pyc
+.env
+skills/
+PROJECT_GUIDELINE.md
