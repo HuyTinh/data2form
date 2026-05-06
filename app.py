@@ -8,6 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import pandas as pd
 from playwright.sync_api import sync_playwright
+from main_desktop import run_desktop_automation_core, get_element_at_cursor
 
 # Setup logging first
 logging.basicConfig(
@@ -65,6 +66,13 @@ class RunRequest(BaseModel):
     open_form_trigger: str = ""
     mappings: dict
     use_session: bool = False
+
+class RunDesktopRequest(BaseModel):
+    filename: str
+    app_identifier: str  # Title or Path
+    submit_selector: str
+    open_form_trigger: str = ""
+    mappings: dict
 
 @app.get("/", response_class=HTMLResponse)
 def read_root():
@@ -136,7 +144,7 @@ def save_preset(req: dict):
     import json
     c.execute("""INSERT OR REPLACE INTO presets (url, submit_selector, use_session, mappings, open_form_trigger, saved_at)
                  VALUES (?, ?, ?, ?, ?, ?)""", 
-              (req['url'], req['submit_selector'], int(req['use_session']), json.dumps(req['mappings']), req.get('open_form_trigger', ''), req['saved_at']))
+               (req['url'], req['submit_selector'], int(req['use_session']), json.dumps(req['mappings']), req.get('open_form_trigger', ''), req['saved_at']))
     conn.commit()
     conn.close()
     logger.info("Lưu cấu hình thành công.")
@@ -463,6 +471,18 @@ def pick_selector(req: PickRequest):
                 browser.close()
             logger.info("Đã đóng phiên trình duyệt bộ chọn.")
 
+@app.get("/api/desktop/pick")
+def pick_desktop_selector():
+    logger.info("Kích hoạt Smart Desktop Picker...")
+    # Give user 3 seconds to switch to the target app and hover
+    import time
+    time.sleep(3)
+    element = get_element_at_cursor()
+    if element:
+        logger.info(f"Đã chọn phần tử Desktop: {element}")
+        return element
+    raise HTTPException(status_code=500, detail="Không thể lấy thông tin phần tử")
+
 import threading
 from main import run_automation_core, AutomationStatus
 
@@ -533,8 +553,216 @@ def run_automation(req: RunRequest):
     
     return {"status": "started"}
 
+@app.post("/api/desktop/run")
+def run_desktop_automation(req: RunDesktopRequest):
+    if current_status.is_running:
+        raise HTTPException(status_code=400, detail="Automation is already running")
+
+    found_path = None
+    for root, dirs, files in os.walk(DATA_DIR):
+        if req.filename in files:
+            found_path = os.path.join(root, req.filename)
+            break
+    
+    if not found_path:
+        raise HTTPException(status_code=404, detail="File not found")
+        
+    current_status.__init__()
+    
+    def wrapped_run():
+        import datetime
+        import json
+        start_time = datetime.datetime.now().strftime("%H:%M:%S %d/%m/%Y")
+        logger.info(f"--- BẮT ĐẦU LUỒNG DESKTOP AUTOMATION ---")
+        
+        try:
+            run_desktop_automation_core(found_path, req.app_identifier, req.mappings, req.submit_selector, current_status, False, req.open_form_trigger)
+        except Exception as e:
+            logger.error(f"Lỗi Desktop Automation: {e}")
+        finally:
+            # Save history logic similar to web...
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            final_status = "Success" if all(l['level'] != 'error' for l in current_status.logs) else "Completed with errors"
+            rel_path = os.path.relpath(found_path, DATA_DIR)
+            c.execute("""INSERT INTO history (filename, rel_path, start_time, total_rows, status, logs)
+                         VALUES (?, ?, ?, ?, ?, ?)""",
+                      (req.filename, rel_path, start_time, current_status.total_rows, 
+                       final_status, json.dumps(current_status.logs)))
+            conn.commit()
+            conn.close()
+            logger.info(f"--- LUỒNG DESKTOP KẾT THÚC ---")
+
+    thread = threading.Thread(target=wrapped_run)
+    thread.daemon = True
+    thread.start()
+    
+    return {"status": "started"}
+
+
+# --- TẦNG PHÂN LOẠI ỨNG DỤNG (Application Classification Layer) ---
+class AppClassifier:
+    APP_MAP = {
+        "chrome.exe": {"name": "Google Chrome", "category": "BROWSER"},
+        "msedge.exe": {"name": "Microsoft Edge", "category": "BROWSER"},
+        "postman.exe": {"name": "Postman", "category": "API_CLIENT"},
+        "code.exe": {"name": "Visual Studio Code", "category": "IDE"},
+        "notepad.exe": {"name": "Notepad", "category": "TEXT_EDITOR"},
+        "excel.exe": {"name": "Microsoft Excel", "category": "SPREADSHEET"},
+        "calc.exe": {"name": "Calculator", "category": "UTILITY"},
+    }
+
+    @staticmethod
+    def get_info(proc_name, exe_path, window_title):
+        # 1. Thử khớp từ bảng ánh xạ process name
+        if proc_name:
+            mapping = AppClassifier.APP_MAP.get(proc_name.lower())
+            if mapping: return mapping["name"], mapping["category"]
+
+        # 2. Thử lấy từ Product Name trong metadata của file .exe
+        if exe_path:
+            try:
+                import win32api
+                lang, codepage = win32api.GetFileVersionInfo(exe_path, '\\VarFileInfo\\Translation')[0]
+                str_info = u'\\StringFileInfo\\%04X%04X\\ProductName' % (lang, codepage)
+                prod_name = win32api.GetFileVersionInfo(exe_path, str_info)
+                if prod_name: return prod_name, "APPLICATION"
+            except: pass
+
+        # 3. Thông minh: Dò tìm từ khóa trong tiêu đề cửa sổ (Fallback cho Postman/Electron)
+        title_lower = window_title.lower()
+        for proc, info in AppClassifier.APP_MAP.items():
+            keyword = info["name"].lower()
+            if keyword in title_lower:
+                return info["name"], info["category"]
+        
+        # 4. Fallback cuối cùng: Dùng tên process hoặc 20 ký tự đầu của tiêu đề
+        if proc_name: return proc_name.replace(".exe", "").capitalize(), "APPLICATION"
+        return window_title[:20], "APPLICATION"
+
+# --- TẦNG PHÂN GIẢI PROCESS (Process Resolution Layer) ---
+class ProcessResolver:
+    @staticmethod
+    def get_proc_info(pid):
+        try:
+            import psutil
+            proc = psutil.Process(pid)
+            return proc.name(), proc.exe()
+        except:
+            # Fallback win32 nếu psutil bị chặn
+            try:
+                import win32api, win32process
+                phandle = win32api.OpenProcess(0x1000, False, pid)
+                path = win32process.QueryFullProcessImageName(phandle, 0)
+                win32api.CloseHandle(phandle)
+                return os.path.basename(path), path
+            except:
+                return None, None
+
+@app.get("/api/desktop/windows")
+def get_desktop_windows():
+    try:
+        import win32gui, win32ui, win32con, win32api, ctypes
+        from ctypes import wintypes
+        from PIL import Image
+        import io
+        import base64
+        
+        results = []
+        DWMWA_CLOAKED = 14
+        
+        def is_window_cloaked(hwnd):
+            cloaked = ctypes.c_int(0)
+            ctypes.windll.dwmapi.DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, ctypes.byref(cloaked), ctypes.sizeof(cloaked))
+            return cloaked.value != 0
+
+        class SHFILEINFO(ctypes.Structure):
+            _fields_ = [
+                ("hIcon", wintypes.HICON),
+                ("iIcon", ctypes.c_int),
+                ("dwAttributes", wintypes.DWORD),
+                ("szDisplayName", wintypes.WCHAR * 260),
+                ("szTypeName", wintypes.WCHAR * 80)
+            ]
+
+        # --- TẦNG DÒ TÌM CỬA SỔ (Window Detection Layer) ---
+        def enum_handler(hwnd, l_param):
+            if not win32gui.IsWindowVisible(hwnd): return
+            title = win32gui.GetWindowText(hwnd)
+            if not title: return
+            if "Data2Form Pro" in title: return
+            
+            ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+            if ex_style & win32con.WS_EX_TOOLWINDOW: return
+            if win32gui.GetWindow(hwnd, win32con.GW_OWNER): return
+            if is_window_cloaked(hwnd): return
+
+            # BẮT ĐẦU PHÂN GIẢI
+            import win32process
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            proc_name, exe_path = ProcessResolver.get_proc_info(pid)
+            
+            # PHÂN LOẠI ỨNG DỤNG
+            app_name, app_category = AppClassifier.get_info(proc_name, exe_path, title)
+            
+            # TRÍCH XUẤT ICON (UI Layer - Large Icon Strategy)
+            icon_base64 = ""
+            try:
+                if exe_path and os.path.exists(exe_path):
+                    # Lấy LARGE icon (32x32) thay vì small (16x16)
+                    large, small = win32gui.ExtractIconEx(exe_path, 0)
+                    
+                    # Ưu tiên large icon để fill đủ bitmap
+                    hicon = large[0] if large else (small[0] if small else None)
+                    
+                    # Cleanup icon handles thừa
+                    for ic in large[1:]: win32gui.DestroyIcon(ic)
+                    for ic in small[1:]: win32gui.DestroyIcon(ic)
+
+                    if not hicon:
+                        hicon = win32gui.SendMessage(hwnd, win32con.WM_GETICON, win32con.ICON_BIG, 0)
+                        if not hicon: hicon = win32gui.GetClassLong(hwnd, win32con.GCL_HICON)
+
+                    if hicon:
+                        # Tạo bitmap 64x64 để lấy icon chất lượng cao
+                        hdc_screen = win32ui.CreateDCFromHandle(win32gui.GetDC(0))
+                        hdc_mem = hdc_screen.CreateCompatibleDC()
+                        hbmp = win32ui.CreateBitmap()
+                        hbmp.CreateCompatibleBitmap(hdc_screen, 64, 64)
+                        hdc_mem.SelectObject(hbmp)
+                        
+                        # DrawIconEx để scale icon về đúng 64x64
+                        win32gui.DrawIconEx(hdc_mem.GetSafeHdc(), 0, 0, hicon, 64, 64, 0, None, win32con.DI_NORMAL)
+                        
+                        # Lấy bits bằng win32ui
+                        bmpstr = hbmp.GetBitmapBits(True)
+                        
+                        img = Image.frombuffer('RGBA', (64, 64), bmpstr, 'raw', 'BGRA', 0, 1)
+                        # Resize về 48x48 LANCZOS để sắc nét
+                        img = img.resize((48, 48), Image.Resampling.LANCZOS)
+                        
+                        buffered = io.BytesIO()
+                        img.save(buffered, format="PNG")
+                        icon_base64 = base64.b64encode(buffered.getvalue()).decode()
+                        
+                        win32gui.DestroyIcon(hicon)
+            except Exception as e:
+                pass
+                
+            results.append({
+                "title": title, 
+                "app_name": app_name,
+                "app_category": app_category,
+                "exe_path": exe_path,
+                "icon": icon_base64
+            })
+
+        win32gui.EnumWindows(enum_handler, None)
+        return sorted(results, key=lambda x: x['title'].lower())
+    except Exception as e:
+        logger.error(f"Error listing windows: {e}")
+        return []
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="", port=8000)
-
+    uvicorn.run(app, host="0.0.0.0", port=8000)

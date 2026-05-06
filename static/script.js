@@ -21,6 +21,7 @@ let previewColumns = [];
 let currentLang = localStorage.getItem('lang') || 'vi';
 let currentlyViewingLogId = null;
 let lastHistoryData = [];
+let currentMode = localStorage.getItem('mode') || 'web';
 
 const TRANSLATIONS = {
     vi: {
@@ -28,12 +29,12 @@ const TRANSLATIONS = {
         nav_monitoring: "Giám sát & Logs",
         nav_history: "Lịch sử thực thi",
         setup_title: "Thiết lập Tự động hóa",
-        setup_desc: "Tải file Excel và ánh xạ các trường dữ liệu lên Form Web",
-        upload_title: "Tải file Excel của bạn",
-        upload_desc: "Kéo thả file vào đây hoặc nhấn để chọn",
-        btn_reset: "Đặt lại toàn bộ",
-        btn_change_file: "Chỉ đổi file",
+        setup_desc: "Tải file Excel và ánh xạ các trường dữ liệu",
         label_url: "URL Trang Web Đích",
+        label_app: "Tên Ứng dụng / Tiêu đề Cửa sổ",
+        placeholder_url: "https://example.com/form",
+        placeholder_app: "Notepad hoặc Calculator",
+        msg_pick_desktop: "Hãy di chuột vào phần tử trong 3 giây...",
         label_use_session: "Duy trì phiên đăng nhập (Persistent)",
         label_submit: "CSS Selector Nút Gửi (Submit)",
         label_trigger: "⚡ Trigger mở Popup/Modal (tùy chọn)",
@@ -94,12 +95,12 @@ const TRANSLATIONS = {
         nav_monitoring: "Monitoring & Logs",
         nav_history: "Execution History",
         setup_title: "Automation Setup",
-        setup_desc: "Upload Excel file and map data fields to Web Form",
-        upload_title: "Upload your Excel file",
-        upload_desc: "Drag and drop file here or click to select",
-        btn_reset: "Full Reset",
-        btn_change_file: "Change File Only",
+        setup_desc: "Upload Excel file and map data fields",
         label_url: "Target Website URL",
+        label_app: "App Name / Window Title",
+        placeholder_url: "https://example.com/form",
+        placeholder_app: "Notepad or Calculator",
+        msg_pick_desktop: "Please hover over the element in 3s...",
         label_use_session: "Keep login session (Persistent)",
         label_submit: "Submit Button CSS Selector",
         label_trigger: "⚡ Open Popup/Modal Trigger (optional)",
@@ -169,6 +170,37 @@ function setLanguage(lang) {
     document.querySelectorAll('.lang-btn').forEach(btn => {
         btn.classList.toggle('active', btn.getAttribute('onclick').includes(lang));
     });
+}
+
+function switchMode(mode) {
+    console.log("Switching to mode:", mode);
+    currentMode = mode;
+    localStorage.setItem('mode', mode);
+    updateModeUI();
+    showToast(`Đã chuyển sang chế độ ${mode.toUpperCase()}`, 'info');
+}
+
+function updateModeUI() {
+    const isWeb = currentMode === 'web';
+    const webBtn = document.getElementById('mode-web');
+    const desktopBtn = document.getElementById('mode-desktop');
+    
+    if (webBtn) webBtn.classList.toggle('active', isWeb);
+    if (desktopBtn) desktopBtn.classList.toggle('active', !isWeb);
+
+    const targetLabel = document.getElementById('label-target');
+    const targetInput = document.getElementById('target-url');
+    const sessionGroup = document.querySelector('.checkbox-group');
+
+    if (isWeb) {
+        if (targetLabel) targetLabel.innerHTML = t('label_url');
+        if (targetInput) targetInput.placeholder = t('placeholder_url');
+        if (sessionGroup) sessionGroup.style.display = 'flex';
+    } else {
+        if (targetLabel) targetLabel.innerHTML = t('label_app');
+        if (targetInput) targetInput.placeholder = t('placeholder_app');
+        if (sessionGroup) sessionGroup.style.display = 'none';
+    }
 }
 
 function updateUIStrings() {
@@ -504,40 +536,71 @@ function renderMappingRows(columns, existingMappings = {}) {
  * Selector Picker
  */
 async function pickSelector(inputId) {
-    const url = document.getElementById('target-url').value;
-    if (!url) { showToast(t('label_url'), 'warning'); return; }
+    const isWeb = currentMode === 'web';
+    
+    if (isWeb) {
+        const url = document.getElementById('target-url').value;
+        if (!url) { showToast(t('label_url'), 'warning'); return; }
 
-    const useSession = document.getElementById('use-session').checked;
+        const useSession = document.getElementById('use-session').checked;
 
-    showLoading(t('msg_analyzing'));
-    try {
-        const response = await fetch('/api/pick-selector', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ url, use_session: useSession })
-        });
-        const data = await response.json();
-        if (response.ok && data.selector) {
-            document.getElementById(inputId).value = data.selector;
-            showToast(t('toast_upload_success'), 'success');
-        }
-    } catch (err) { showToast(t('nav_monitoring'), 'error'); }
-    hideLoading();
+        showLoading(t('msg_analyzing'));
+        try {
+            const response = await fetch('/api/pick-selector', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url, use_session: useSession })
+            });
+            const data = await response.json();
+            if (response.ok && data.selector) {
+                document.getElementById(inputId).value = data.selector;
+                showToast(t('toast_upload_success'), 'success');
+            }
+        } catch (err) { showToast(t('nav_monitoring'), 'error'); }
+        hideLoading();
+    } else {
+        // Desktop Picking
+        showLoading(t('msg_pick_desktop'));
+        try {
+            const response = await fetch('/api/desktop/pick');
+            const data = await response.json();
+            if (response.ok) {
+                // Priority: AutoID > Name > Coordinate Fallback
+                let selector = data.auto_id || data.name;
+                let typeInfo = data.auto_id ? "ID" : (data.name ? "Name" : "Tọa độ");
+                
+                if (!selector && data.rel_x !== undefined) {
+                    selector = `coord:${data.rel_x},${data.rel_y}`;
+                }
+
+                if (selector) {
+                    document.getElementById(inputId).value = selector;
+                    showToast(`🎯 Đã nhận diện (${typeInfo}): ${selector}`, 'success');
+                } else {
+                    showToast('Không tìm thấy định danh phần tử. Hãy thử di chuột vào vùng khác.', 'warning');
+                }
+            }
+        } catch (err) { showToast('Lỗi Picker Desktop', 'error'); }
+        hideLoading();
+    }
 }
 
 /**
  * Automation Control
  */
 document.getElementById('run-btn').addEventListener('click', async () => {
-    const targetUrl = document.getElementById('target-url').value;
+    const targetVal = document.getElementById('target-url').value;
     const submitSelector = document.getElementById('submit-selector').value;
 
-    if (!targetUrl) { showToast(t('label_url'), 'warning'); return; }
+    if (!targetVal) { 
+        showToast(currentMode === 'web' ? t('label_url') : t('label_app'), 'warning'); 
+        return; 
+    }
 
     const mappings = {};
     document.querySelectorAll('#mapping-container .mapping-row').forEach((row, i) => {
-        const input = row.querySelector(`input[id="map-input-${i}"]`);
-        const select = row.querySelector(`select[id="map-type-${i}"]`);
+        const input = row.querySelector(`input[id^="map-input-"]`);
+        const select = row.querySelector(`select[id^="map-type-"]`);
         if (input) {
             const col = input.getAttribute('data-col');
             const val = input.value.trim();
@@ -549,17 +612,26 @@ document.getElementById('run-btn').addEventListener('click', async () => {
     });
 
     try {
-        const response = await fetch('/api/run', {
+        const endpoint = currentMode === 'web' ? '/api/run' : '/api/desktop/run';
+        const body = currentMode === 'web' ? {
+            filename: uploadedFileName,
+            url: targetVal,
+            submit_selector: submitSelector,
+            open_form_trigger: document.getElementById('open-form-trigger').value.trim(),
+            mappings: mappings,
+            use_session: document.getElementById('use-session').checked
+        } : {
+            filename: uploadedFileName,
+            app_identifier: targetVal,
+            submit_selector: submitSelector,
+            open_form_trigger: document.getElementById('open-form-trigger').value.trim(),
+            mappings: mappings
+        };
+
+        const response = await fetch(endpoint, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                filename: uploadedFileName,
-                url: targetUrl,
-                submit_selector: submitSelector,
-                open_form_trigger: document.getElementById('open-form-trigger').value.trim(),
-                mappings: mappings,
-                use_session: document.getElementById('use-session').checked
-            })
+            body: JSON.stringify(body)
         });
 
         if (response.ok) {
@@ -945,6 +1017,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     updateUIStrings();
+    updateModeUI();
 
     // Restore active section
     const savedSection = localStorage.getItem('activeSection') || 'upload';
@@ -952,4 +1025,74 @@ document.addEventListener('DOMContentLoaded', () => {
 
     startStatusPolling();
     fetchHistory();
+});
+
+// --- Window Suggestion for Desktop Mode with Icons ---
+const targetInput = document.getElementById('target-url');
+const windowDropdown = document.getElementById('window-dropdown');
+
+if (targetInput) {
+    targetInput.addEventListener('focus', fetchWindows);
+    targetInput.addEventListener('input', filterWindows);
+}
+
+async function fetchWindows() {
+    if (currentMode !== 'desktop') return;
+    
+    try {
+        const response = await fetch('/api/desktop/windows');
+        const windows = await response.json();
+        
+        if (windows.length > 0) {
+            windowDropdown.innerHTML = windows.map(win => `
+                <div class="dropdown-item" data-title="${win.title.replace(/"/g, '&quot;')}" title="${win.app_name} — ${win.title.replace(/"/g, '&quot;')}">
+                    <div class="icon-wrap">
+                        ${win.icon ? `<img src="data:image/png;base64,${win.icon}" width="24" height="24" />` : '<span class="no-icon">🪟</span>'}
+                    </div>
+                    <div class="item-info">
+                        <div class="app-name" title="${win.app_name}">${win.app_name}</div>
+                        <div class="window-title" title="${win.title.replace(/"/g, '&quot;')}">${win.title}</div>
+                    </div>
+                </div>
+            `).join('');
+            windowDropdown.style.display = 'block';
+            
+            // Gán sự kiện click cho từng item mới tạo
+            windowDropdown.querySelectorAll('.dropdown-item').forEach(item => {
+                item.onclick = function() {
+                    targetInput.value = this.getAttribute('data-title');
+                    windowDropdown.style.display = 'none';
+                    if (typeof handleUrlInput === 'function') handleUrlInput();
+                };
+            });
+        }
+    } catch (err) {
+        console.error("Lỗi khi lấy danh sách cửa sổ:", err);
+    }
+}
+
+function filterWindows() {
+    if (currentMode !== 'desktop') return;
+    const filter = targetInput.value.toLowerCase();
+    const items = windowDropdown.querySelectorAll('.dropdown-item');
+    let hasVisible = false;
+    
+    items.forEach(item => {
+        const appName = item.querySelector('.app-name').textContent.toLowerCase();
+        const winTitle = item.querySelector('.window-title').textContent.toLowerCase();
+        const isMatch = appName.includes(filter) || winTitle.includes(filter);
+        item.style.display = isMatch ? 'flex' : 'none';
+        if (isMatch) hasVisible = true;
+    });
+    
+    windowDropdown.style.display = hasVisible ? 'block' : 'none';
+}
+
+// Đóng dropdown khi click ra ngoài
+document.addEventListener('click', (e) => {
+    if (targetInput && windowDropdown) {
+        if (!targetInput.contains(e.target) && !windowDropdown.contains(e.target)) {
+            windowDropdown.style.display = 'none';
+        }
+    }
 });
