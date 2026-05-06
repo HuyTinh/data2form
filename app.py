@@ -3,7 +3,7 @@ import shutil
 import logging
 import sys
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import pandas as pd
@@ -39,13 +39,17 @@ async def lifespan(app: FastAPI):
     # Cleanup only error screenshots on startup, keep data/ for history
     if os.path.exists("static"):
         for f in os.listdir("static"):
-            if f.endswith(".png"):
+            if f.endswith(".png") and f != "favicon.png":
                 try: os.remove(os.path.join("static", f))
                 except: pass
     yield
 
 app = FastAPI(title="Data2Form API", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+@app.get('/favicon.ico', include_in_schema=False)
+async def favicon():
+    return FileResponse("static/favicon.png")
 
 DATA_DIR = "stores"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -532,5 +536,5 @@ def run_automation(req: RunRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="", port=8000)
 
