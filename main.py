@@ -43,10 +43,12 @@ def run_automation_core(excel_path: str, url: str, mappings: dict, submit_select
         status.log(f"Khởi động tiến trình cho file: {os.path.basename(excel_path)}")
     
     try:
-        df = pd.read_excel(excel_path, dtype=str)
-        df = df.fillna("")
+        df = pd.read_excel(excel_path, engine='openpyxl', dtype=str).fillna("")
+        total = len(df)
+        cols = list(df.columns)
         if status:
-            status.total_rows = len(df)
+            status.total_rows = total
+            status.log(f"📊 Excel: Tìm thấy {total} dòng và {len(cols)} cột: {', '.join(cols)}")
     except Exception as e:
         if status: status.log(f"Lỗi đọc file: {e}", "error")
         raise
@@ -88,7 +90,9 @@ def run_automation_core(excel_path: str, url: str, mappings: dict, submit_select
             for index, row in df.iterrows():
                 if status:
                     status.current_row = index + 1
-                    status.log(f"--- Đang xử lý dòng {index + 1} ---")
+                    row_data_str = ", ".join([f"{k}: {v}" for k, v in row.to_dict().items()])
+                    status.log(f"--- 🚀 Đang xử lý dòng {index + 1}/{status.total_rows} ---")
+                    status.log(f"📦 Dữ liệu: {row_data_str}")
                 
                 try:
                     # --- Step 0: Click global trigger to open modal/popup if specified ---

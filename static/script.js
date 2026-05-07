@@ -88,7 +88,17 @@ const TRANSLATIONS = {
         btn_close: "Đóng x",
         loading: "Đang tải...",
         wait_start: "Chờ bắt đầu...",
-        msg_file_deleted: "Đã xóa file cũ. Vui lòng chọn file mới."
+        msg_file_deleted: "Đã xóa file cũ. Vui lòng chọn file mới.",
+        toast_mode_switched: "Đã chuyển sang chế độ {mode}",
+        toast_desktop_picked: "🎯 Đã nhận diện ({type}): {selector}",
+        toast_desktop_not_found: "Không tìm thấy định danh phần tử. Hãy thử di chuột vào vùng khác.",
+        toast_desktop_picker_err: "Lỗi Picker Desktop",
+        toast_auto_start: "Bắt đầu quá trình tự động hóa...",
+        toast_conn_error: "Lỗi kết nối",
+        type_coord: "Tọa độ",
+        toast_completed: "Tiến trình hoàn thành!",
+        mode_web: "🌐 Web",
+        mode_desktop: "🖥️ Desktop"
     },
     en: {
         nav_upload: "Upload & Config",
@@ -154,7 +164,17 @@ const TRANSLATIONS = {
         btn_close: "Close x",
         loading: "Loading...",
         wait_start: "Waiting to start...",
-        msg_file_deleted: "Old file deleted. Please select a new one."
+        msg_file_deleted: "Old file deleted. Please select a new one.",
+        toast_mode_switched: "Switched to {mode} mode",
+        toast_desktop_picked: "🎯 Detected ({type}): {selector}",
+        toast_desktop_not_found: "Element identifier not found. Try hovering elsewhere.",
+        toast_desktop_picker_err: "Desktop Picker Error",
+        toast_auto_start: "Starting automation process...",
+        toast_conn_error: "Connection Error",
+        type_coord: "Coordinates",
+        toast_completed: "Process completed!",
+        mode_web: "🌐 Web",
+        mode_desktop: "🖥️ Desktop"
     }
 };
 
@@ -177,14 +197,14 @@ function switchMode(mode) {
     currentMode = mode;
     localStorage.setItem('mode', mode);
     updateModeUI();
-    showToast(`Đã chuyển sang chế độ ${mode.toUpperCase()}`, 'info');
+    showToast(t('toast_mode_switched').replace('{mode}', mode.toUpperCase()), 'info');
 }
 
 function updateModeUI() {
     const isWeb = currentMode === 'web';
     const webBtn = document.getElementById('mode-web');
     const desktopBtn = document.getElementById('mode-desktop');
-    
+
     if (webBtn) webBtn.classList.toggle('active', isWeb);
     if (desktopBtn) desktopBtn.classList.toggle('active', !isWeb);
 
@@ -537,7 +557,7 @@ function renderMappingRows(columns, existingMappings = {}) {
  */
 async function pickSelector(inputId) {
     const isWeb = currentMode === 'web';
-    
+
     if (isWeb) {
         const url = document.getElementById('target-url').value;
         if (!url) { showToast(t('label_url'), 'warning'); return; }
@@ -567,20 +587,20 @@ async function pickSelector(inputId) {
             if (response.ok) {
                 // Priority: AutoID > Name > Coordinate Fallback
                 let selector = data.auto_id || data.name;
-                let typeInfo = data.auto_id ? "ID" : (data.name ? "Name" : "Tọa độ");
-                
+                let typeInfo = data.auto_id ? "ID" : (data.name ? "Name" : t('type_coord'));
+
                 if (!selector && data.rel_x !== undefined) {
                     selector = `coord:${data.rel_x},${data.rel_y}`;
                 }
 
                 if (selector) {
                     document.getElementById(inputId).value = selector;
-                    showToast(`🎯 Đã nhận diện (${typeInfo}): ${selector}`, 'success');
+                    showToast(t('toast_desktop_picked').replace('{type}', typeInfo).replace('{selector}', selector), 'success');
                 } else {
-                    showToast('Không tìm thấy định danh phần tử. Hãy thử di chuột vào vùng khác.', 'warning');
+                    showToast(t('toast_desktop_not_found'), 'warning');
                 }
             }
-        } catch (err) { showToast('Lỗi Picker Desktop', 'error'); }
+        } catch (err) { showToast(t('toast_desktop_picker_err'), 'error'); }
         hideLoading();
     }
 }
@@ -592,9 +612,9 @@ document.getElementById('run-btn').addEventListener('click', async () => {
     const targetVal = document.getElementById('target-url').value;
     const submitSelector = document.getElementById('submit-selector').value;
 
-    if (!targetVal) { 
-        showToast(currentMode === 'web' ? t('label_url') : t('label_app'), 'warning'); 
-        return; 
+    if (!targetVal) {
+        showToast(currentMode === 'web' ? t('label_url') : t('label_app'), 'warning');
+        return;
     }
 
     const mappings = {};
@@ -637,12 +657,12 @@ document.getElementById('run-btn').addEventListener('click', async () => {
         if (response.ok) {
             showSection('monitoring');
             startStatusPolling();
-            showToast('Bắt đầu quá trình tự động hóa...', 'info');
+            showToast(t('toast_auto_start'), 'info');
         } else {
             const err = await response.json();
             showToast(err.detail, 'error');
         }
-    } catch (err) { showToast('Lỗi kết nối', 'error'); }
+    } catch (err) { showToast(t('toast_conn_error'), 'error'); }
 });
 
 /**
@@ -662,7 +682,7 @@ function startStatusPolling() {
                 const lastLog = status.logs[status.logs.length - 1];
                 if (lastLog.level === 'success' || lastLog.level === 'error' && status.current_row >= status.total_rows) {
                     clearInterval(statusInterval);
-                    showToast('Tiến trình hoàn thành!', 'info');
+                    showToast(t('toast_completed'), 'info');
                     fetchHistory();
                 }
             }
@@ -1038,11 +1058,11 @@ if (targetInput) {
 
 async function fetchWindows() {
     if (currentMode !== 'desktop') return;
-    
+
     try {
         const response = await fetch('/api/desktop/windows');
         const windows = await response.json();
-        
+
         if (windows.length > 0) {
             windowDropdown.innerHTML = windows.map(win => `
                 <div class="dropdown-item" data-title="${win.title.replace(/"/g, '&quot;')}" title="${win.app_name} — ${win.title.replace(/"/g, '&quot;')}">
@@ -1056,10 +1076,10 @@ async function fetchWindows() {
                 </div>
             `).join('');
             windowDropdown.style.display = 'block';
-            
+
             // Gán sự kiện click cho từng item mới tạo
             windowDropdown.querySelectorAll('.dropdown-item').forEach(item => {
-                item.onclick = function() {
+                item.onclick = function () {
                     targetInput.value = this.getAttribute('data-title');
                     windowDropdown.style.display = 'none';
                     if (typeof handleUrlInput === 'function') handleUrlInput();
@@ -1076,7 +1096,7 @@ function filterWindows() {
     const filter = targetInput.value.toLowerCase();
     const items = windowDropdown.querySelectorAll('.dropdown-item');
     let hasVisible = false;
-    
+
     items.forEach(item => {
         const appName = item.querySelector('.app-name').textContent.toLowerCase();
         const winTitle = item.querySelector('.window-title').textContent.toLowerCase();
@@ -1084,7 +1104,7 @@ function filterWindows() {
         item.style.display = isMatch ? 'flex' : 'none';
         if (isMatch) hasVisible = true;
     });
-    
+
     windowDropdown.style.display = hasVisible ? 'block' : 'none';
 }
 
@@ -1093,6 +1113,10 @@ document.addEventListener('click', (e) => {
     if (targetInput && windowDropdown) {
         if (!targetInput.contains(e.target) && !windowDropdown.contains(e.target)) {
             windowDropdown.style.display = 'none';
+        }
+    }
+});
+windowDropdown.style.display = 'none';
         }
     }
 });

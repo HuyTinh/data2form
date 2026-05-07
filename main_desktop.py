@@ -20,8 +20,19 @@ def run_desktop_automation_core(excel_path: str, app_identifier: str, mappings: 
         status.log(f"Khởi động tự động hóa Desktop (Chế độ: {'Toàn màn hình' if not app_identifier else app_identifier})")
 
     try:
-        df = pd.read_excel(excel_path, dtype=str).fillna("")
-        if status: status.total_rows = len(df)
+        # Sử dụng engine='openpyxl' để đọc file .xlsx chuẩn hơn
+        df = pd.read_excel(excel_path, engine='openpyxl', dtype=str).fillna("")
+        
+        total = len(df)
+        cols = list(df.columns)
+        
+        if status: 
+            status.total_rows = total
+            status.log(f"📊 Excel: Tìm thấy {total} dòng và {len(cols)} cột: {', '.join(cols)}")
+            if total == 0:
+                status.log("⚠️ Cảnh báo: File Excel không có dữ liệu hoặc định dạng không đúng.", "warning")
+            elif total > 0:
+                logger.info(f"Dữ liệu dòng đầu: {df.iloc[0].to_dict()}")
         
         # Connect to specific app or use global Desktop
         app_main = None
@@ -54,7 +65,34 @@ def run_desktop_automation_core(excel_path: str, app_identifier: str, mappings: 
         for index, row in df.iterrows():
             if status:
                 status.current_row = index + 1
-                status.log(f"--- Đang xử lý dòng {index + 1} ---")
+                row_data_str = ", ".join([f"{k}: {v}" for k, v in row.to_dict().items()])
+                status.log(f"--- 🚀 Đang xử lý dòng {index + 1}/{total} ---")
+                status.log(f"📦 Dữ liệu: {row_data_str}")
+
+            # --- Step 0: Click global trigger to open form/popup ---
+            if open_form_trigger:
+                try:
+                    trigger_btn = None
+                    search_targets = []
+                    if app_main: search_targets.append(app_main)
+                    search_targets.append(global_desktop)
+
+                    for target in search_targets:
+                        for s in [{"title": open_form_trigger}, {"name": open_form_trigger}, {"auto_id": open_form_trigger}]:
+                            try:
+                                candidate = target.child_window(**s)
+                                if candidate.exists(timeout=1.0):
+                                    trigger_btn = candidate
+                                    break
+                            except: continue
+                        if trigger_btn: break
+
+                    if trigger_btn:
+                        trigger_btn.click_input()
+                        if status: status.log(f"⚡ Đã click trigger để mở form")
+                        time.sleep(1.0) # Chờ form mở ra
+                except Exception as te:
+                    logger.warning(f"Trigger click failed: {te}")
 
             # --- Fill fields ---
             for col, mapping_data in mappings.items():

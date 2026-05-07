@@ -600,168 +600,157 @@ def run_desktop_automation(req: RunDesktopRequest):
     return {"status": "started"}
 
 
-# --- TẦNG PHÂN LOẠI ỨNG DỤNG (Application Classification Layer) ---
+# ─── Module-level imports cho Desktop Engine ───────────────────────────────
+import win32gui, win32ui, win32con, win32api, win32process, ctypes
+from ctypes import wintypes
+import psutil, io, base64
+from PIL import Image
+
+# ─── Application Classification Layer ──────────────────────────────────────
 class AppClassifier:
-    APP_MAP = {
-        "chrome.exe": {"name": "Google Chrome", "category": "BROWSER"},
-        "msedge.exe": {"name": "Microsoft Edge", "category": "BROWSER"},
-        "postman.exe": {"name": "Postman", "category": "API_CLIENT"},
-        "code.exe": {"name": "Visual Studio Code", "category": "IDE"},
-        "notepad.exe": {"name": "Notepad", "category": "TEXT_EDITOR"},
-        "excel.exe": {"name": "Microsoft Excel", "category": "SPREADSHEET"},
-        "calc.exe": {"name": "Calculator", "category": "UTILITY"},
-    }
+    _info_cache: dict = {}  # Cache: exe_path → (name, category)
 
-    @staticmethod
-    def get_info(proc_name, exe_path, window_title):
-        # 1. Thử khớp từ bảng ánh xạ process name
-        if proc_name:
-            mapping = AppClassifier.APP_MAP.get(proc_name.lower())
-            if mapping: return mapping["name"], mapping["category"]
+    @classmethod
+    def get_info(cls, proc_name: str, exe_path: str, window_title: str):
+        # Cache hit
+        if exe_path and exe_path in cls._info_cache:
+            return cls._info_cache[exe_path]
 
-        # 2. Thử lấy từ Product Name trong metadata của file .exe
-        if exe_path:
+        result = None
+        # 1. Đọc ProductName từ metadata .exe
+        if not result and exe_path:
             try:
-                import win32api
-                lang, codepage = win32api.GetFileVersionInfo(exe_path, '\\VarFileInfo\\Translation')[0]
-                str_info = u'\\StringFileInfo\\%04X%04X\\ProductName' % (lang, codepage)
-                prod_name = win32api.GetFileVersionInfo(exe_path, str_info)
-                if prod_name: return prod_name, "APPLICATION"
-            except: pass
+                trans = win32api.GetFileVersionInfo(exe_path, '\\VarFileInfo\\Translation')[0]
+                key = u'\\StringFileInfo\\%04X%04X\\ProductName' % trans
+                prod = win32api.GetFileVersionInfo(exe_path, key)
+                if prod:
+                    result = prod.strip(), "APPLICATION"
+            except Exception:
+                pass
 
-        # 3. Thông minh: Dò tìm từ khóa trong tiêu đề cửa sổ (Fallback cho Postman/Electron)
-        title_lower = window_title.lower()
-        for proc, info in AppClassifier.APP_MAP.items():
-            keyword = info["name"].lower()
-            if keyword in title_lower:
-                return info["name"], info["category"]
-        
-        # 4. Fallback cuối cùng: Dùng tên process hoặc 20 ký tự đầu của tiêu đề
-        if proc_name: return proc_name.replace(".exe", "").capitalize(), "APPLICATION"
-        return window_title[:20], "APPLICATION"
+        # 2. Fallback
+        if not result:
+            name = proc_name.replace(".exe", "").capitalize() if proc_name else window_title[:20]
+            result = name, "APPLICATION"
 
-# --- TẦNG PHÂN GIẢI PROCESS (Process Resolution Layer) ---
+        if exe_path:
+            cls._info_cache[exe_path] = result
+        return result
+
+
+# ─── Process Resolution Layer ───────────────────────────────────────────────
 class ProcessResolver:
     @staticmethod
-    def get_proc_info(pid):
+    def get_proc_info(pid: int):
         try:
-            import psutil
             proc = psutil.Process(pid)
             return proc.name(), proc.exe()
-        except:
-            # Fallback win32 nếu psutil bị chặn
+        except Exception:
             try:
-                import win32api, win32process
                 phandle = win32api.OpenProcess(0x1000, False, pid)
                 path = win32process.QueryFullProcessImageName(phandle, 0)
                 win32api.CloseHandle(phandle)
                 return os.path.basename(path), path
-            except:
+            except Exception:
                 return None, None
 
+
+# ─── Icon Extraction Helpers ─────────────────────────────────────────────────
+_icon_cache: dict = {}  # Cache: exe_path → base64 PNG string
+DWMWA_CLOAKED = 14
+
+def _is_cloaked(hwnd: int) -> bool:
+    val = ctypes.c_int(0)
+    ctypes.windll.dwmapi.DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, ctypes.byref(val), ctypes.sizeof(val))
+    return val.value != 0
+
+def _extract_icon(exe_path: str, hwnd: int) -> str:
+    """Trích xuất icon từ exe hoặc window, trả về base64 PNG. Cache theo exe_path."""
+    if exe_path and exe_path in _icon_cache:
+        return _icon_cache[exe_path]
+
+    hicon = None
+    try:
+        # Ưu tiên large icon từ file .exe (chất lượng cao nhất)
+        if exe_path and os.path.exists(exe_path):
+            large, small = win32gui.ExtractIconEx(exe_path, 0)
+            hicon = large[0] if large else (small[0] if small else None)
+            for ic in large[1:]: win32gui.DestroyIcon(ic)
+            for ic in small[1:]: win32gui.DestroyIcon(ic)
+
+        # Fallback: lấy từ window handle
+        if not hicon:
+            hicon = win32gui.SendMessage(hwnd, win32con.WM_GETICON, win32con.ICON_BIG, 0)
+        if not hicon:
+            hicon = win32gui.GetClassLong(hwnd, win32con.GCL_HICON)
+
+        if not hicon:
+            return ""
+
+        # Vẽ icon lên bitmap 64×64
+        hdc_screen = win32ui.CreateDCFromHandle(win32gui.GetDC(0))
+        hdc_mem = hdc_screen.CreateCompatibleDC()
+        hbmp = win32ui.CreateBitmap()
+        hbmp.CreateCompatibleBitmap(hdc_screen, 64, 64)
+        hdc_mem.SelectObject(hbmp)
+        win32gui.DrawIconEx(hdc_mem.GetSafeHdc(), 0, 0, hicon, 64, 64, 0, None, win32con.DI_NORMAL)
+
+        bmpstr = hbmp.GetBitmapBits(True)
+        img = Image.frombuffer('RGBA', (64, 64), bmpstr, 'raw', 'BGRA', 0, 1)
+        img = img.resize((48, 48), Image.Resampling.LANCZOS)
+
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        result = base64.b64encode(buf.getvalue()).decode()
+
+        win32gui.DestroyIcon(hicon)
+        if exe_path:
+            _icon_cache[exe_path] = result
+        return result
+
+    except Exception:
+        return ""
+
+
+# ─── API Endpoint ────────────────────────────────────────────────────────────
 @app.get("/api/desktop/windows")
 def get_desktop_windows():
+    results = []
+
+    def enum_handler(hwnd, _):
+        if not win32gui.IsWindowVisible(hwnd):
+            return
+        title = win32gui.GetWindowText(hwnd)
+        if not title or "Data2Form Pro" in title:
+            return
+        ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+        if ex_style & win32con.WS_EX_TOOLWINDOW:
+            return
+        if win32gui.GetWindow(hwnd, win32con.GW_OWNER):
+            return
+        if _is_cloaked(hwnd):
+            return
+
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        proc_name, exe_path = ProcessResolver.get_proc_info(pid)
+        app_name, app_category = AppClassifier.get_info(proc_name, exe_path, title)
+        icon_b64 = _extract_icon(exe_path, hwnd)
+
+        results.append({
+            "title":        title,
+            "app_name":     app_name,
+            "app_category": app_category,
+            "exe_path":     exe_path,
+            "icon":         icon_b64,
+        })
+
     try:
-        import win32gui, win32ui, win32con, win32api, ctypes
-        from ctypes import wintypes
-        from PIL import Image
-        import io
-        import base64
-        
-        results = []
-        DWMWA_CLOAKED = 14
-        
-        def is_window_cloaked(hwnd):
-            cloaked = ctypes.c_int(0)
-            ctypes.windll.dwmapi.DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, ctypes.byref(cloaked), ctypes.sizeof(cloaked))
-            return cloaked.value != 0
-
-        class SHFILEINFO(ctypes.Structure):
-            _fields_ = [
-                ("hIcon", wintypes.HICON),
-                ("iIcon", ctypes.c_int),
-                ("dwAttributes", wintypes.DWORD),
-                ("szDisplayName", wintypes.WCHAR * 260),
-                ("szTypeName", wintypes.WCHAR * 80)
-            ]
-
-        # --- TẦNG DÒ TÌM CỬA SỔ (Window Detection Layer) ---
-        def enum_handler(hwnd, l_param):
-            if not win32gui.IsWindowVisible(hwnd): return
-            title = win32gui.GetWindowText(hwnd)
-            if not title: return
-            if "Data2Form Pro" in title: return
-            
-            ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
-            if ex_style & win32con.WS_EX_TOOLWINDOW: return
-            if win32gui.GetWindow(hwnd, win32con.GW_OWNER): return
-            if is_window_cloaked(hwnd): return
-
-            # BẮT ĐẦU PHÂN GIẢI
-            import win32process
-            _, pid = win32process.GetWindowThreadProcessId(hwnd)
-            proc_name, exe_path = ProcessResolver.get_proc_info(pid)
-            
-            # PHÂN LOẠI ỨNG DỤNG
-            app_name, app_category = AppClassifier.get_info(proc_name, exe_path, title)
-            
-            # TRÍCH XUẤT ICON (UI Layer - Large Icon Strategy)
-            icon_base64 = ""
-            try:
-                if exe_path and os.path.exists(exe_path):
-                    # Lấy LARGE icon (32x32) thay vì small (16x16)
-                    large, small = win32gui.ExtractIconEx(exe_path, 0)
-                    
-                    # Ưu tiên large icon để fill đủ bitmap
-                    hicon = large[0] if large else (small[0] if small else None)
-                    
-                    # Cleanup icon handles thừa
-                    for ic in large[1:]: win32gui.DestroyIcon(ic)
-                    for ic in small[1:]: win32gui.DestroyIcon(ic)
-
-                    if not hicon:
-                        hicon = win32gui.SendMessage(hwnd, win32con.WM_GETICON, win32con.ICON_BIG, 0)
-                        if not hicon: hicon = win32gui.GetClassLong(hwnd, win32con.GCL_HICON)
-
-                    if hicon:
-                        # Tạo bitmap 64x64 để lấy icon chất lượng cao
-                        hdc_screen = win32ui.CreateDCFromHandle(win32gui.GetDC(0))
-                        hdc_mem = hdc_screen.CreateCompatibleDC()
-                        hbmp = win32ui.CreateBitmap()
-                        hbmp.CreateCompatibleBitmap(hdc_screen, 64, 64)
-                        hdc_mem.SelectObject(hbmp)
-                        
-                        # DrawIconEx để scale icon về đúng 64x64
-                        win32gui.DrawIconEx(hdc_mem.GetSafeHdc(), 0, 0, hicon, 64, 64, 0, None, win32con.DI_NORMAL)
-                        
-                        # Lấy bits bằng win32ui
-                        bmpstr = hbmp.GetBitmapBits(True)
-                        
-                        img = Image.frombuffer('RGBA', (64, 64), bmpstr, 'raw', 'BGRA', 0, 1)
-                        # Resize về 48x48 LANCZOS để sắc nét
-                        img = img.resize((48, 48), Image.Resampling.LANCZOS)
-                        
-                        buffered = io.BytesIO()
-                        img.save(buffered, format="PNG")
-                        icon_base64 = base64.b64encode(buffered.getvalue()).decode()
-                        
-                        win32gui.DestroyIcon(hicon)
-            except Exception as e:
-                pass
-                
-            results.append({
-                "title": title, 
-                "app_name": app_name,
-                "app_category": app_category,
-                "exe_path": exe_path,
-                "icon": icon_base64
-            })
-
         win32gui.EnumWindows(enum_handler, None)
-        return sorted(results, key=lambda x: x['title'].lower())
     except Exception as e:
         logger.error(f"Error listing windows: {e}")
-        return []
+
+    return sorted(results, key=lambda x: x["title"].lower())
+
 
 if __name__ == "__main__":
     import uvicorn
