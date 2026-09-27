@@ -1,9 +1,14 @@
 venv/
+.venv/
 __pycache__/
 *.pyc
 .env
 skills/
-PROJECT_GUIDELINE.md
 .browser_session/
 stores/
 automation.db
+automation.db-shm
+automation.db-wal
+.serena/
+.hermes/
+.pytest_cache/
