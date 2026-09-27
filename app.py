@@ -1,14 +1,30 @@
 import os
-import shutil
 import logging
 import sys
+import threading
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
-import pandas as pd
-from playwright.sync_api import sync_playwright
-from main_desktop import run_desktop_automation_core, get_element_at_cursor
+from pydantic import BaseModel, Field
+from main import AutomationStatus, run_automation_core, run_mapping_plan_core
+from mapping_plan import load_mapping_plan_workbook
+import persistence
+from request_security import ALLOWED_DEV_ORIGINS, is_loopback_origin, is_safe_mutation_request
+from selector_picker import run_selector_picker as _run_selector_picker
+from workbook_service import (
+    DATA_CACHE,
+    DATA_DIR,
+    SHEET_CACHE,
+    WORKBOOK_CACHE,
+    clear_workbook_cache,
+    find_uploaded_file as _find_uploaded_file,
+    get_preview as _get_workbook_preview,
+    upload_workbook,
+)
+
 
 # Setup logging first
 logging.basicConfig(
@@ -33,182 +49,115 @@ try:
 except Exception:
     pass
 
-from contextlib import asynccontextmanager
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Cleanup only error screenshots on startup, keep data/ for history
-    if os.path.exists("static"):
-        for f in os.listdir("static"):
-            if f.endswith(".png") and f != "favicon.png":
-                try: os.remove(os.path.join("static", f))
-                except: pass
     yield
 
 app = FastAPI(title="Data2Form API", lifespan=lifespan)
+
+# Allow CORS for development with Vite
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=sorted(ALLOWED_DEV_ORIGINS),
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+    allow_headers=["*"],
+)
+
+
+@app.middleware("http")
+async def reject_cross_site_mutations(request, call_next):
+    request_origin = f"{request.url.scheme}://{request.url.netloc}"
+    if not is_loopback_origin(request_origin):
+        return JSONResponse(status_code=403, content={"detail": "Data2Form is only available from loopback hosts"})
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        if not is_safe_mutation_request(
+            request.headers.get("origin"),
+            request_origin,
+            request.headers.get("sec-fetch-site"),
+        ):
+            return JSONResponse(status_code=403, content={"detail": "Cross-site mutations are not allowed"})
+    return await call_next(request)
+
+# Mount static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# Mount React built assets if available
+DIST_DIR = os.path.join(os.path.dirname(__file__), "frontend", "dist")
+if os.path.exists(DIST_DIR) and os.path.exists(os.path.join(DIST_DIR, "assets")):
+    app.mount("/assets", StaticFiles(directory=os.path.join(DIST_DIR, "assets")), name="assets")
 
 @app.get('/favicon.ico', include_in_schema=False)
 async def favicon():
+    if os.path.exists("static/favicon.ico"):
+        return FileResponse("static/favicon.ico")
     return FileResponse("static/favicon.png")
-
-DATA_DIR = "stores"
-os.makedirs(DATA_DIR, exist_ok=True)
 
 class PickRequest(BaseModel):
     url: str
     use_session: bool = False
 
+class PickerTarget(BaseModel):
+    id: str
+    label: str
+
+class PickSelectorsRequest(PickRequest):
+    target_count: int = Field(ge=1, le=100)
+    target_labels: list[str] = Field(default_factory=list)
+    targets: list[PickerTarget] = Field(default_factory=list)
+
 class RunRequest(BaseModel):
     filename: str
     url: str
-    submit_selector: str
+    submit_selector: str = ""
     open_form_trigger: str = ""
-    mappings: dict
+    mappings: dict = Field(default_factory=dict)
+    mapping_plan: dict | None = None
     use_session: bool = False
+    table_mode: bool = False
+    row_save_selector: str = ""
+    row_save_timeout: int = 8000  # milliseconds
 
-class RunDesktopRequest(BaseModel):
-    filename: str
-    app_identifier: str  # Title or Path
-    submit_selector: str
-    open_form_trigger: str = ""
-    mappings: dict
 
 @app.get("/", response_class=HTMLResponse)
 def read_root():
+    index_file = os.path.join(DIST_DIR, "index.html")
     try:
-        with open("static/index.html", "r", encoding="utf-8") as f:
+        with open(index_file, "r", encoding="utf-8") as f:
             return f.read()
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="index.html not found")
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Frontend build not found. Run `npm run build` in the frontend directory.",
+        ) from exc
 
-import sqlite3
 
 DB_PATH = "automation.db"
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    # Table for Presets (URL -> Config)
-    c.execute("""CREATE TABLE IF NOT EXISTS presets (
-        url TEXT PRIMARY KEY,
-        submit_selector TEXT,
-        use_session INTEGER,
-        mappings TEXT,
-        open_form_trigger TEXT DEFAULT '',
-        saved_at TEXT
-    )""")
-    # Table for History
-    c.execute("""CREATE TABLE IF NOT EXISTS history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        filename TEXT,
-        rel_path TEXT,
-        start_time TEXT,
-        total_rows INTEGER,
-        status TEXT,
-        logs TEXT
-    )""")
-    # Migrate: add open_form_trigger column if not exists
-    try:
-        c.execute("ALTER TABLE presets ADD COLUMN open_form_trigger TEXT DEFAULT ''")
-    except:
-        pass  # Column already exists
-    conn.commit()
-    conn.close()
+    persistence.init_db(DB_PATH)
 
 init_db()
 
-DATA_CACHE = {}
-
 @app.get("/api/presets")
 def get_preset(url: str):
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM presets WHERE url = ?", (url,))
-    row = c.fetchone()
-    conn.close()
-    if row:
-        res = dict(row)
-        import json
-        res['mappings'] = json.loads(res['mappings'])
-        res['open_form_trigger'] = res.get('open_form_trigger', '') or ''
-        return res
-    return None
+    return persistence.get_preset(url, DB_PATH)
 
 @app.post("/api/presets")
 def save_preset(req: dict):
-    logger.info(f"Đang lưu/cập nhật cấu hình cho URL: {req.get('url')}")
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    import json
-    c.execute("""INSERT OR REPLACE INTO presets (url, submit_selector, use_session, mappings, open_form_trigger, saved_at)
-                 VALUES (?, ?, ?, ?, ?, ?)""", 
-               (req['url'], req['submit_selector'], int(req['use_session']), json.dumps(req['mappings']), req.get('open_form_trigger', ''), req['saved_at']))
-    conn.commit()
-    conn.close()
-    logger.info("Lưu cấu hình thành công.")
-    return {"status": "saved"}
+    return persistence.save_preset(req, DB_PATH)
 
 @app.get("/api/history")
 def get_history():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT id, filename, rel_path, start_time, total_rows, status FROM history ORDER BY id DESC")
-    rows = [dict(r) for r in c.fetchall()]
-    conn.close()
-    return rows
-
-import json
+    return persistence.get_history(DB_PATH)
 
 @app.get("/api/history/{item_id}/logs")
 def get_history_logs(item_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT logs FROM history WHERE id = ?", (item_id,))
-    row = c.fetchone()
-    conn.close()
-    if row:
-        return json.loads(row[0])
-    return []
+    return persistence.get_history_logs(item_id, DB_PATH)
 
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
-    import datetime
-    today = datetime.date.today().isoformat()
-    store_dir = os.path.join(DATA_DIR, today)
-    os.makedirs(store_dir, exist_ok=True)
-    
-    # Clean filename handling
-    base_name, ext = os.path.splitext(file.filename)
-    unique_filename = file.filename
-    counter = 1
-    
-    # Check if file exists, if so, append (1), (2)...
-    while os.path.exists(os.path.join(store_dir, unique_filename)):
-        unique_filename = f"{base_name}_{counter}{ext}"
-        counter += 1
-        
-    file_path = os.path.join(store_dir, unique_filename)
-    logger.info(f"Đang tải file: {file.filename} -> Đã lưu thành: {unique_filename}")
-    
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    
-    try:
-        df = pd.read_excel(file_path, dtype=str).fillna("")
-        DATA_CACHE[unique_filename] = df
-        columns = df.columns.tolist()
-        return {
-            "filename": unique_filename, 
-            "rel_path": os.path.join(today, unique_filename),
-            "columns": columns,
-            "total_rows": len(df)
-        }
-    except Exception as e:
-        if os.path.exists(file_path): os.remove(file_path)
-        raise HTTPException(status_code=400, detail=f"Invalid Excel file: {e}")
+    return upload_workbook(file)
 
 @app.get("/api/download/{item_id}")
 def download_history_file(item_id: int):
@@ -216,11 +165,7 @@ def download_history_file(item_id: int):
     import io
     from fastapi.responses import StreamingResponse
 
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT rel_path FROM history WHERE id = ?", (item_id,))
-    row = c.fetchone()
-    conn.close()
+    row = persistence.get_history_rel_path(item_id, DB_PATH)
 
     if not row:
         raise HTTPException(status_code=404, detail="History record not found")
@@ -245,258 +190,72 @@ def download_history_file(item_id: int):
 
 @app.post("/api/clear-cache")
 def clear_cache(filename: str):
-    if filename in DATA_CACHE:
-        del DATA_CACHE[filename]
-        logger.info(f"Cleared cache for file: {filename}")
-        return {"status": "cleared"}
-    return {"status": "not_in_cache"}
+    return clear_workbook_cache(filename)
+
+
 @app.get("/api/preview")
-def get_preview(filename: str, page: int = 1, page_size: int = 20, query: str = ""):
-    if filename not in DATA_CACHE:
-        found_path = None
-        if os.path.exists(DATA_DIR):
-            for root, dirs, files in os.walk(DATA_DIR):
-                if filename in files:
-                    found_path = os.path.join(root, filename)
-                    break
-        
-        if found_path:
-            try:
-                DATA_CACHE[filename] = pd.read_excel(found_path, dtype=str).fillna("")
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Error reading Excel: {e}")
-        else:
-            raise HTTPException(status_code=404, detail=f"File '{filename}' không thấy trong '{DATA_DIR}'")
-            
-    df = DATA_CACHE[filename]
-    
-    # Filtering
-    if query:
-        # Filter trên tất cả các cột
-        mask = df.apply(lambda row: row.astype(str).str.contains(query, case=False).any(), axis=1)
-        df = df[mask]
-    
-    total_filtered = len(df)
-    start = (page - 1) * page_size
-    end = start + page_size
-    
-    rows = df.iloc[start:end].to_dict(orient="records")
-    return {
-        "data": rows,
-        "total": total_filtered
-    }
+def get_preview(filename: str, page: int = 1, page_size: int = 20, query: str = "", sheet_name: str | None = None):
+    return _get_workbook_preview(filename, page, page_size, query, sheet_name)
+
+
+
 
 @app.post("/api/pick-selector")
 def pick_selector(req: PickRequest):
-    inject_script = r"""
-    () => {
-        return new Promise((resolve) => {
-            // Container for UI
-            const ui = document.createElement('div');
-            ui.id = 'd2f-picker-ui';
-            Object.assign(ui.style, {
-                position: 'fixed', top: '20px', left: '50%', transform: 'translateX(-50%)',
-                zIndex: '2147483647', background: 'rgba(255, 255, 255, 0.95)',
-                padding: '12px 20px', borderRadius: '12px', boxShadow: '0 8px 32px rgba(0,0,0,0.2)',
-                display: 'flex', gap: '15px', alignItems: 'center',
-                fontFamily: '"Outfit", sans-serif', border: '1px solid #3498db',
-                backdropFilter: 'blur(10px)', transition: 'all 0.3s ease'
-            });
+    selections = _run_selector_picker(req.url, req.use_session, [{"id": "single", "label": "Selector"}])
+    return {"selector": selections[0]["selector"] if selections else None}
 
-            const statusInfo = document.createElement('div');
-            statusInfo.innerHTML = '<strong style="color: #2c3e50;">D2F Picker:</strong> <span id="picker-mode-text" style="color: #e67e22;">Đang điều hướng...</span>';
-            statusInfo.style.fontSize = '14px';
 
-            const pickBtn = document.createElement('button');
-            pickBtn.innerText = '🎯 Bắt đầu chọn';
-            Object.assign(pickBtn.style, {
-                padding: '8px 16px', background: '#3498db', color: 'white',
-                border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold'
-            });
+@app.post("/api/pick-selectors")
+def pick_selectors(req: PickSelectorsRequest):
+    if req.targets:
+        targets = [{"id": target.id.strip(), "label": target.label.strip()} for target in req.targets]
+        ids = [target["id"] for target in targets]
+        if len(targets) != req.target_count or any(not target["id"] or not target["label"] for target in targets):
+            raise HTTPException(status_code=422, detail="targets must provide a unique id and label for every requested field")
+        if len(ids) != len(set(ids)):
+            raise HTTPException(status_code=422, detail="target ids must be unique")
+        allow_any_target = True
+    else:
+        if req.target_labels and len(req.target_labels) != req.target_count:
+            raise HTTPException(status_code=422, detail="target_labels length must match target_count")
+        targets = [
+            {"id": str(index), "label": label or f"Ô {index + 1}"}
+            for index, label in enumerate(req.target_labels[:req.target_count])
+        ]
+        if not targets:
+            targets = [{"id": str(index), "label": f"Ô {index + 1}"} for index in range(req.target_count)]
+        allow_any_target = False
 
-            const cancelBtn = document.createElement('button');
-            cancelBtn.innerText = 'Đóng';
-            Object.assign(cancelBtn.style, {
-                padding: '8px 16px', background: '#95a5a6', color: 'white',
-                border: 'none', borderRadius: '6px', cursor: 'pointer'
-            });
+    selections = _run_selector_picker(req.url, req.use_session, targets, allow_any_target)
+    response = {"selectors": [selection["selector"] for selection in selections]}
+    if req.targets:
+        response["selections"] = selections
+    return response
 
-            ui.appendChild(statusInfo);
-            ui.appendChild(pickBtn);
-            ui.appendChild(cancelBtn);
-            document.body.appendChild(ui);
-
-            // Overlay for picking
-            const overlay = document.createElement('div');
-            Object.assign(overlay.style, {
-                position: 'fixed', top: '0', left: '0', width: '100vw', height: '100vh',
-                zIndex: '2147483646', cursor: 'crosshair', pointerEvents: 'none',
-                border: '4px solid #e67e22', boxSizing: 'border-box', display: 'none'
-            });
-            document.body.appendChild(overlay);
-
-            let isPicking = false;
-            let lastHovered = null;
-            let originalOutline = '';
-
-            const getPath = (el) => {
-                if (el.id) return `#${CSS.escape(el.id)}`;
-                if (el.name) return `[name="${CSS.escape(el.name)}"]`;
-                if (el.className && typeof el.className === 'string') {
-                    const classes = el.className.trim().split(/\s+/).filter(c => c && !c.includes(':'));
-                    for (let cls of classes) {
-                        try {
-                            const selector = `.${CSS.escape(cls)}`;
-                            if (document.querySelectorAll(selector).length === 1) return selector;
-                        } catch(e) {}
-                    }
-                }
-                let path = el.tagName.toLowerCase();
-                let parent = el.parentNode;
-                if (parent && parent !== document) {
-                    let children = Array.from(parent.children).filter(c => c.tagName === el.tagName);
-                    if (children.length > 1) {
-                        let index = children.indexOf(el) + 1;
-                        path += `:nth-of-type(${index})`;
-                    }
-                    path = getPath(parent) + ' > ' + path;
-                }
-                return path;
-            };
-
-            const mouseMoveHandler = (e) => {
-                if (!isPicking) return;
-                const el = document.elementFromPoint(e.clientX, e.clientY);
-                if (el && el !== overlay && !ui.contains(el) && el !== lastHovered) {
-                    if (lastHovered) lastHovered.style.outline = originalOutline;
-                    lastHovered = el;
-                    originalOutline = el.style.outline;
-                    el.style.outline = '3px solid #e74c3c';
-                }
-            };
-
-            const clickHandler = (e) => {
-                if (!isPicking) return;
-                if (ui.contains(e.target)) return;
-
-                try {
-                    e.preventDefault(); e.stopPropagation();
-                    let el = document.elementFromPoint(e.clientX, e.clientY);
-                    
-                    if (el && el !== overlay && !ui.contains(el)) {
-                        const tagName = el.tagName ? el.tagName.toUpperCase() : '';
-                        if (!['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON'].includes(tagName)) {
-                            const innerInput = el.querySelector('input, textarea, select, button');
-                            if (innerInput) el = innerInput;
-                        }
-
-                        const selector = getPath(el);
-                        cleanup();
-                        resolve(selector);
-                    }
-                } catch (err) { console.error('Picker Error:', err); }
-            };
-
-            const cleanup = () => {
-                if (lastHovered) lastHovered.style.outline = originalOutline;
-                window.removeEventListener('mousemove', mouseMoveHandler);
-                window.removeEventListener('click', clickHandler, true);
-                if (document.body.contains(overlay)) document.body.removeChild(overlay);
-                if (document.body.contains(ui)) document.body.removeChild(ui);
-            };
-
-            pickBtn.onclick = () => {
-                isPicking = !isPicking;
-                if (isPicking) {
-                    pickBtn.innerText = '⏸️ Đang chọn (Click để dừng)';
-                    pickBtn.style.background = '#e67e22';
-                    overlay.style.display = 'block';
-                    document.getElementById('picker-mode-text').innerText = 'Hãy nhấp vào phần tử cần chọn';
-                    document.getElementById('picker-mode-text').style.color = '#e74c3c';
-                } else {
-                    pickBtn.innerText = '🎯 Bắt đầu chọn';
-                    pickBtn.style.background = '#3498db';
-                    overlay.style.display = 'none';
-                    document.getElementById('picker-mode-text').innerText = 'Đang điều hướng...';
-                    document.getElementById('picker-mode-text').style.color = '#e67e22';
-                    if (lastHovered) lastHovered.style.outline = originalOutline;
-                }
-            };
-
-            cancelBtn.onclick = () => {
-                cleanup();
-                resolve(null);
-            };
-
-            window.addEventListener('mousemove', mouseMoveHandler);
-            window.addEventListener('click', clickHandler, true);
-        });
-    }
-    """
-    
-    # Use a persistent context to remember login sessions if requested
-    user_data_dir = os.path.join(os.getcwd(), ".browser_session")
-    
-    with sync_playwright() as p:
-        browser = None
-        context = None
-        try:
-            if req.use_session:
-                logger.info(f"Khởi động bộ chọn (Persistent Context) cho URL: {req.url}")
-                context = p.chromium.launch_persistent_context(
-                    user_data_dir=user_data_dir,
-                    headless=False,
-                    no_viewport=True,
-                    ignore_https_errors=True
-                )
-                page = context.pages[0] if context.pages else context.new_page()
-            else:
-                logger.info(f"Khởi động bộ chọn (Clean Context) cho URL: {req.url}")
-                browser = p.chromium.launch(headless=False)
-                context = browser.new_context(ignore_https_errors=True)
-                page = context.new_page()
-            
-            page.goto(req.url, wait_until="domcontentloaded", timeout=60000)
-            logger.info("Đã tải xong trang. Chờ người dùng chọn phần tử...")
-            selector = page.evaluate(inject_script)
-            logger.info(f"Người dùng đã chọn Selector: {selector}")
-            return {"selector": selector}
-        except Exception as e:
-            logger.error(f"Lỗi bộ chọn: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
-        finally:
-            if context:
-                context.close()
-            if browser:
-                browser.close()
-            logger.info("Đã đóng phiên trình duyệt bộ chọn.")
-
-@app.get("/api/desktop/pick")
-def pick_desktop_selector():
-    logger.info("Kích hoạt Smart Desktop Picker...")
-    # Give user 3 seconds to switch to the target app and hover
-    import time
-    time.sleep(3)
-    element = get_element_at_cursor()
-    if element:
-        logger.info(f"Đã chọn phần tử Desktop: {element}")
-        return element
-    raise HTTPException(status_code=500, detail="Không thể lấy thông tin phần tử")
-
-import threading
-from main import run_automation_core, AutomationStatus
 
 # Global status tracker
 current_status = AutomationStatus()
 
 @app.get("/api/status")
 def get_status():
+    normalized_logs = []
+    for l in current_status.logs[-20:]:
+        msg_text = l.get("message") or l.get("msg") or ""
+        normalized_logs.append({
+            "time": l.get("time", ""),
+            "message": msg_text,
+            "msg": msg_text,
+            "level": l.get("level", "info")
+        })
     return {
         "is_running": current_status.is_running,
         "current_row": current_status.current_row,
         "total_rows": current_status.total_rows,
-        "logs": current_status.logs[-20:], # Return last 20 logs
-        "screenshots": current_status.screenshots
+        "logs": normalized_logs,
+        "screenshots": current_status.screenshots,
+        "row_results": current_status.row_results,
+        "detail_results": current_status.detail_results,
     }
 
 @app.post("/api/run")
@@ -504,15 +263,15 @@ def run_automation(req: RunRequest):
     if current_status.is_running:
         raise HTTPException(status_code=400, detail="Automation is already running")
         
-    # Tìm file thực tế trên ổ đĩa (vì có thể nằm trong folder ngày)
-    found_path = None
-    for root, dirs, files in os.walk(DATA_DIR):
-        if req.filename in files:
-            found_path = os.path.join(root, req.filename)
-            break
-            
+    found_path = _find_uploaded_file(req.filename)
     if not found_path:
         raise HTTPException(status_code=404, detail="File not found")
+
+    if req.mapping_plan is not None:
+        try:
+            load_mapping_plan_workbook(found_path, req.mapping_plan)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     
     file_path = found_path
     rel_path = os.path.relpath(found_path, DATA_DIR)
@@ -523,27 +282,30 @@ def run_automation(req: RunRequest):
     # Run in background thread
     def wrapped_run():
         import datetime
-        import json
         start_time = datetime.datetime.now().strftime("%H:%M:%S %d/%m/%Y")
         logger.info(f"--- BẮT ĐẦU LUỒNG TỰ ĐỘNG HÓA ---")
         logger.info(f"File xử lý: {req.filename}")
         logger.info(f"URL mục tiêu: {req.url}")
         
         try:
-            run_automation_core(file_path, req.url, req.mappings, req.submit_selector, current_status, req.use_session, req.open_form_trigger)
+            if req.mapping_plan is not None:
+                run_mapping_plan_core(file_path, req.url, req.mapping_plan, current_status, req.use_session)
+            else:
+                run_automation_core(file_path, req.url, req.mappings, req.submit_selector, current_status, req.use_session, req.open_form_trigger, req.table_mode, req.row_save_selector, req.row_save_timeout)
         except Exception as e:
             logger.error(f"NGUY HIỂM: Luồng tự động hóa thất bại: {e}")
         finally:
             logger.info("Đang lưu lịch sử thực thi vào cơ sở dữ liệu...")
-            conn = sqlite3.connect(DB_PATH)
-            c = conn.cursor()
-            final_status = "Success" if all(l['level'] != 'error' for l in current_status.logs) else "Completed with errors"
-            c.execute("""INSERT INTO history (filename, rel_path, start_time, total_rows, status, logs)
-                         VALUES (?, ?, ?, ?, ?, ?)""",
-                      (req.filename, rel_path, start_time, current_status.total_rows, 
-                       final_status, json.dumps(current_status.logs)))
-            conn.commit()
-            conn.close()
+            final_status = "Success" if not current_status.has_errors else "Completed with errors"
+            persistence.save_run_history(
+                req.filename,
+                rel_path,
+                start_time,
+                current_status.total_rows,
+                final_status,
+                current_status.logs,
+                DB_PATH,
+            )
             logger.info(f"--- LUỒNG TỰ ĐỘNG HÓA KẾT THÚC (Trạng thái: {final_status}) ---")
 
     logger.info("Đang chuyển tác vụ tự động hóa vào luồng chạy ngầm...")
@@ -553,205 +315,7 @@ def run_automation(req: RunRequest):
     
     return {"status": "started"}
 
-@app.post("/api/desktop/run")
-def run_desktop_automation(req: RunDesktopRequest):
-    if current_status.is_running:
-        raise HTTPException(status_code=400, detail="Automation is already running")
-
-    found_path = None
-    for root, dirs, files in os.walk(DATA_DIR):
-        if req.filename in files:
-            found_path = os.path.join(root, req.filename)
-            break
-    
-    if not found_path:
-        raise HTTPException(status_code=404, detail="File not found")
-        
-    current_status.__init__()
-    
-    def wrapped_run():
-        import datetime
-        import json
-        start_time = datetime.datetime.now().strftime("%H:%M:%S %d/%m/%Y")
-        logger.info(f"--- BẮT ĐẦU LUỒNG DESKTOP AUTOMATION ---")
-        
-        try:
-            run_desktop_automation_core(found_path, req.app_identifier, req.mappings, req.submit_selector, current_status, False, req.open_form_trigger)
-        except Exception as e:
-            logger.error(f"Lỗi Desktop Automation: {e}")
-        finally:
-            # Save history logic similar to web...
-            conn = sqlite3.connect(DB_PATH)
-            c = conn.cursor()
-            final_status = "Success" if all(l['level'] != 'error' for l in current_status.logs) else "Completed with errors"
-            rel_path = os.path.relpath(found_path, DATA_DIR)
-            c.execute("""INSERT INTO history (filename, rel_path, start_time, total_rows, status, logs)
-                         VALUES (?, ?, ?, ?, ?, ?)""",
-                      (req.filename, rel_path, start_time, current_status.total_rows, 
-                       final_status, json.dumps(current_status.logs)))
-            conn.commit()
-            conn.close()
-            logger.info(f"--- LUỒNG DESKTOP KẾT THÚC ---")
-
-    thread = threading.Thread(target=wrapped_run)
-    thread.daemon = True
-    thread.start()
-    
-    return {"status": "started"}
-
-
-# ─── Module-level imports cho Desktop Engine ───────────────────────────────
-import win32gui, win32ui, win32con, win32api, win32process, ctypes
-from ctypes import wintypes
-import psutil, io, base64
-from PIL import Image
-
-# ─── Application Classification Layer ──────────────────────────────────────
-class AppClassifier:
-    _info_cache: dict = {}  # Cache: exe_path → (name, category)
-
-    @classmethod
-    def get_info(cls, proc_name: str, exe_path: str, window_title: str):
-        # Cache hit
-        if exe_path and exe_path in cls._info_cache:
-            return cls._info_cache[exe_path]
-
-        result = None
-        # 1. Đọc ProductName từ metadata .exe
-        if not result and exe_path:
-            try:
-                trans = win32api.GetFileVersionInfo(exe_path, '\\VarFileInfo\\Translation')[0]
-                key = u'\\StringFileInfo\\%04X%04X\\ProductName' % trans
-                prod = win32api.GetFileVersionInfo(exe_path, key)
-                if prod:
-                    result = prod.strip(), "APPLICATION"
-            except Exception:
-                pass
-
-        # 2. Fallback
-        if not result:
-            name = proc_name.replace(".exe", "").capitalize() if proc_name else window_title[:20]
-            result = name, "APPLICATION"
-
-        if exe_path:
-            cls._info_cache[exe_path] = result
-        return result
-
-
-# ─── Process Resolution Layer ───────────────────────────────────────────────
-class ProcessResolver:
-    @staticmethod
-    def get_proc_info(pid: int):
-        try:
-            proc = psutil.Process(pid)
-            return proc.name(), proc.exe()
-        except Exception:
-            try:
-                phandle = win32api.OpenProcess(0x1000, False, pid)
-                path = win32process.QueryFullProcessImageName(phandle, 0)
-                win32api.CloseHandle(phandle)
-                return os.path.basename(path), path
-            except Exception:
-                return None, None
-
-
-# ─── Icon Extraction Helpers ─────────────────────────────────────────────────
-_icon_cache: dict = {}  # Cache: exe_path → base64 PNG string
-DWMWA_CLOAKED = 14
-
-def _is_cloaked(hwnd: int) -> bool:
-    val = ctypes.c_int(0)
-    ctypes.windll.dwmapi.DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, ctypes.byref(val), ctypes.sizeof(val))
-    return val.value != 0
-
-def _extract_icon(exe_path: str, hwnd: int) -> str:
-    """Trích xuất icon từ exe hoặc window, trả về base64 PNG. Cache theo exe_path."""
-    if exe_path and exe_path in _icon_cache:
-        return _icon_cache[exe_path]
-
-    hicon = None
-    try:
-        # Ưu tiên large icon từ file .exe (chất lượng cao nhất)
-        if exe_path and os.path.exists(exe_path):
-            large, small = win32gui.ExtractIconEx(exe_path, 0)
-            hicon = large[0] if large else (small[0] if small else None)
-            for ic in large[1:]: win32gui.DestroyIcon(ic)
-            for ic in small[1:]: win32gui.DestroyIcon(ic)
-
-        # Fallback: lấy từ window handle
-        if not hicon:
-            hicon = win32gui.SendMessage(hwnd, win32con.WM_GETICON, win32con.ICON_BIG, 0)
-        if not hicon:
-            hicon = win32gui.GetClassLong(hwnd, win32con.GCL_HICON)
-
-        if not hicon:
-            return ""
-
-        # Vẽ icon lên bitmap 64×64
-        hdc_screen = win32ui.CreateDCFromHandle(win32gui.GetDC(0))
-        hdc_mem = hdc_screen.CreateCompatibleDC()
-        hbmp = win32ui.CreateBitmap()
-        hbmp.CreateCompatibleBitmap(hdc_screen, 64, 64)
-        hdc_mem.SelectObject(hbmp)
-        win32gui.DrawIconEx(hdc_mem.GetSafeHdc(), 0, 0, hicon, 64, 64, 0, None, win32con.DI_NORMAL)
-
-        bmpstr = hbmp.GetBitmapBits(True)
-        img = Image.frombuffer('RGBA', (64, 64), bmpstr, 'raw', 'BGRA', 0, 1)
-        img = img.resize((48, 48), Image.Resampling.LANCZOS)
-
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        result = base64.b64encode(buf.getvalue()).decode()
-
-        win32gui.DestroyIcon(hicon)
-        if exe_path:
-            _icon_cache[exe_path] = result
-        return result
-
-    except Exception:
-        return ""
-
-
-# ─── API Endpoint ────────────────────────────────────────────────────────────
-@app.get("/api/desktop/windows")
-def get_desktop_windows():
-    results = []
-
-    def enum_handler(hwnd, _):
-        if not win32gui.IsWindowVisible(hwnd):
-            return
-        title = win32gui.GetWindowText(hwnd)
-        if not title or "Data2Form Pro" in title:
-            return
-        ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
-        if ex_style & win32con.WS_EX_TOOLWINDOW:
-            return
-        if win32gui.GetWindow(hwnd, win32con.GW_OWNER):
-            return
-        if _is_cloaked(hwnd):
-            return
-
-        _, pid = win32process.GetWindowThreadProcessId(hwnd)
-        proc_name, exe_path = ProcessResolver.get_proc_info(pid)
-        app_name, app_category = AppClassifier.get_info(proc_name, exe_path, title)
-        icon_b64 = _extract_icon(exe_path, hwnd)
-
-        results.append({
-            "title":        title,
-            "app_name":     app_name,
-            "app_category": app_category,
-            "exe_path":     exe_path,
-            "icon":         icon_b64,
-        })
-
-    try:
-        win32gui.EnumWindows(enum_handler, None)
-    except Exception as e:
-        logger.error(f"Error listing windows: {e}")
-
-    return sorted(results, key=lambda x: x["title"].lower())
-
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8000)
