@@ -7,3 +7,7 @@ PROJECT_GUIDELINE.md
 .browser_session/
 stores/
 automation.db
+node_modules/
+.hermes/
+.serena/
+dist/

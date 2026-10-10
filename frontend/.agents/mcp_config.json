@@ -1,0 +1,61 @@
+{
+  "mcpServers": {
+    "playwright-headless-docker": {
+      "command": "docker",
+      "args": [
+        "run",
+        "--rm",
+        "-i",
+        "--init",
+        "--pull=never",
+        "--read-only",
+        "--tmpfs",
+        "/tmp:rw,nosuid,nodev,size=512m",
+        "--workdir",
+        "/tmp",
+        "--env",
+        "XDG_CONFIG_HOME=/tmp/.config",
+        "--env",
+        "XDG_CACHE_HOME=/tmp/.cache",
+        "--memory=2g",
+        "--cpus=2",
+        "--pids-limit=256",
+        "--shm-size=1g",
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges",
+        "--mount",
+        "type=bind,source=C:/Users/ACER/hermes-workspace/artifacts/data2form-frontend,target=/artifacts",
+        "mcr.microsoft.com/playwright/mcp@sha256:77dccc5ce9e94cb8ae7ebea87ddbb6cd54b05760c4d63c54e16accf2726b8734",
+        "--isolated",
+        "--allowed-origins",
+        "http://host.docker.internal:5173",
+        "--output-dir",
+        "/artifacts/agy-browser-only-smoke",
+        "--timeout-navigation",
+        "45000",
+        "--timeout-action",
+        "5000",
+        "--console-level",
+        "warning"
+      ],
+      "disabledTools": [
+        "browser_click",
+        "browser_drag",
+        "browser_drop",
+        "browser_evaluate",
+        "browser_file_upload",
+        "browser_fill_form",
+        "browser_handle_dialog",
+        "browser_hover",
+        "browser_select_option",
+        "browser_close",
+        "browser_navigate_back",
+        "browser_network_request",
+        "browser_press_key",
+        "browser_run_code_unsafe",
+        "browser_type",
+        "browser_wait_for"
+      ]
+    }
+  }
+}
